@@ -112,6 +112,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *
    * 我们知道还需要3秒才能提供3个permit,如果我们对利用不足感兴趣,会希望优先使用过去的令牌,如果我们对溢出更感兴趣,
    * 我们会希望优先使用新的令牌,这样我们就需要一个阀门时间.
+   *
    * We already know how much time it takes to serve 3 fresh permits: if the rate is
    * "1 token per second", then this will take 3 seconds. But what does it mean to serve 7 stored
    * permits? As explained above, there is no unique answer. If we are primarily interested to deal
@@ -122,6 +123,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
    *
    * 由storedPermitsToWaitTime提供这个功能,将storedPermits(1->maxStoredPermits)转换成1/rate(周期),
    * storedPermits可以知道未使用时间.
+   *
    * This role is played by storedPermitsToWaitTime(double storedPermits, double permitsToTake). The
    * underlying model is a continuous function mapping storedPermits (from 0.0 to maxStoredPermits)
    * onto the 1/rate (i.e. intervals) that is effective at the given storedPermits. "storedPermits"
@@ -276,14 +278,14 @@ abstract class SmoothRateLimiter extends RateLimiter {
             // 假设QPS是10, 默认coldFactor是3,则stableIntervalMicros = 1/10 = 100ms
             // coldIntervalMicros = 300ms
             double coldIntervalMicros = stableIntervalMicros * coldFactor;
-            // thresholdPermits = (0.5 * QPS) * warmupPeriodMicros秒
+            // thresholdPermits = warmupPeriodMicros * (0.5 * QPS)
             // 假设QPS是10 warmup是1,那么thresholdPermits就是5
             // 假设QPS是10 warmup是2,那么thresholdPermits就是10
             thresholdPermits = 0.5 * warmupPeriodMicros / stableIntervalMicros;
             // QPS是10 那么maxPermits = thresholdPermits + 2.0 * warmupPeriodMicros / 4倍stableIntervalMicros
             // warmup是1,maxPermits就是10
             // warmup是2,maxPermits就是20
-            // 在coldFactor为3时, maxPermits = 2thresholdPermits
+            // 在coldFactor为3时, maxPermits = 2thresholdPermits = warmupPeriodMicros * QPS
             maxPermits =
                     thresholdPermits + 2.0 * warmupPeriodMicros / (stableIntervalMicros + coldIntervalMicros);
             // 斜率计算
@@ -302,21 +304,26 @@ abstract class SmoothRateLimiter extends RateLimiter {
         }
 
         @Override
-        long storedPermitsToWaitTime(double storedPermits, double permitsToTake) {
-            // 已经保存了多少阈值之上的permit
+        long storedPermitsToWaitTime(double storedPermits, double storedPermitsToSpend) {
+            // 目前storedPermits令牌是否已经大于thresholdPermits
+            // 大于thresholdPermits就要先从大于的扣,不够再扣除thresholdPermits以下的
+            // 不大于thresholdPermits直接可以从thresholdPermits扣除
             double availablePermitsAboveThreshold = storedPermits - thresholdPermits;
             long micros = 0;
             // measuring the integral on the right part of the function (the climbing line)
+            // 需要用到大于thresholdPermits的permit
             if (availablePermitsAboveThreshold > 0.0) {
-                double permitsAboveThresholdToTake = min(availablePermitsAboveThreshold, permitsToTake);
+                // 需要多少大于阈值的thresholdPermits的permit
+                double permitsAboveThresholdToTake = min(availablePermitsAboveThreshold, storedPermitsToSpend);
                 // TODO(cpovirk): Figure out a good name for this variable.
                 double length = permitsToTime(availablePermitsAboveThreshold)
                         + permitsToTime(availablePermitsAboveThreshold - permitsAboveThresholdToTake);
                 micros = (long) (permitsAboveThresholdToTake * length / 2.0);
-                permitsToTake -= permitsAboveThresholdToTake;
+                // 需要多少阈值以下的
+                storedPermitsToSpend -= permitsAboveThresholdToTake;
             }
             // measuring the integral on the left part of the function (the horizontal line)
-            micros += (stableIntervalMicros * permitsToTake);
+            micros += (stableIntervalMicros * storedPermitsToSpend);
             return micros;
         }
 
@@ -324,6 +331,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
             return stableIntervalMicros + permits * slope;
         }
 
+        //maxPermits = 2thresholdPermits = warmupPeriodMicros * QPS
         @Override
         double coolDownIntervalMicros() {
             return warmupPeriodMicros / maxPermits;
@@ -357,6 +365,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
         @Override
         void doSetRate(double permitsPerSecond, double stableIntervalMicros) {
             double oldMaxPermits = this.maxPermits;
+            // 最大容量就是permitsPerSecond
             maxPermits = maxBurstSeconds * permitsPerSecond;
             if (oldMaxPermits == Double.POSITIVE_INFINITY) {
                 // if we don't special-case this, we would get storedPermits == NaN, below
@@ -411,7 +420,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
 
     @Override
     final void doSetRate(double permitsPerSecond, long nowMicros) {
-        resync(nowMicros);
+        resync(nowMicros);// 补充令牌
         double stableIntervalMicros = SECONDS.toMicros(1L) / permitsPerSecond;
         this.stableIntervalMicros = stableIntervalMicros;
         doSetRate(permitsPerSecond, stableIntervalMicros);
@@ -424,6 +433,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
         return SECONDS.toMicros(1L) / stableIntervalMicros;
     }
 
+    // 下次获取的时候需要减去的时间
     @Override
     final long queryEarliestAvailable(long nowMicros) {
         return nextFreeTicketMicros;
@@ -440,13 +450,21 @@ abstract class SmoothRateLimiter extends RateLimiter {
     // 此例中qps=10，stableIntervalMicros=1/10=100ms。
     // 最后更新下一次允许请求的时间nextFreeTickeMicros，并计算还剩余的令牌数：
     // 还剩余令牌数=当前剩余令牌数（storedPermits）-拿走的令牌（storedPermitsToSpend）。
+
+    /**
+     * @return 返回需要等待多久,同时更新storedPermits等信息
+     */
     @Override
     final long reserveEarliestAvailable(int requiredPermits, long nowMicros) {
+        // 如果上次请求过多不会更改nextFreeTicketMicros,返回后可能需要等待
+        // 否则不需要等待
         resync(nowMicros);//补充令牌
         long returnValue = nextFreeTicketMicros;
-        //这次请求消耗的剩余令牌数目
+        // 这次请求消耗的剩余令牌数目
         double storedPermitsToSpend = min(requiredPermits, this.storedPermits);
+        // 需要多少新的令牌
         double freshPermits = requiredPermits - storedPermitsToSpend;
+        // 下次请求需要等待时间
         long waitMicros =
                 storedPermitsToWaitTime(this.storedPermits, storedPermitsToSpend)
                         + (long) (freshPermits * stableIntervalMicros);
@@ -466,6 +484,7 @@ abstract class SmoothRateLimiter extends RateLimiter {
     abstract long storedPermitsToWaitTime(double storedPermits, double permitsToTake);
 
     /**
+     * 也就是未使用时多少时间能缓存一个permit
      * Returns the number of microseconds during cool down that we have to wait to get a new permit.
      */
     abstract double coolDownIntervalMicros();
@@ -477,7 +496,9 @@ abstract class SmoothRateLimiter extends RateLimiter {
         // if nextFreeTicket is in the past, resync to now
         if (nowMicros > nextFreeTicketMicros) {
             double newPermits = (nowMicros - nextFreeTicketMicros) / coolDownIntervalMicros();
+            // 更新过去一段时间未使用的storedPermits
             storedPermits = min(maxPermits, storedPermits + newPermits);
+            // 下一次请求以nextFreeTicketMicros确认能够产生多少permit
             nextFreeTicketMicros = nowMicros;
         }
     }

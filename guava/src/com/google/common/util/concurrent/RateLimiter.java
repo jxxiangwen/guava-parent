@@ -291,7 +291,7 @@ public abstract class RateLimiter {
     @CanIgnoreReturnValue
     public double acquire(int permits) {
         long microsToWait = reserve(permits);//先计算获取这些请求需要让线程等待多长时间
-        stopwatch.sleepMicrosUninterruptibly(microsToWait);//让线程阻塞microTowait微秒长的时间
+        stopwatch.sleepMicrosUninterruptibly(microsToWait);//让线程阻塞microTowait的时间
         return 1.0 * microsToWait / SECONDS.toMicros(1L);
     }
 
@@ -384,7 +384,7 @@ public abstract class RateLimiter {
 
     /**
      * Reserves next ticket and returns the wait time that the caller must wait for.
-     *
+     * 返回需要等到多久
      * @return the required wait time, never negative
      */
     final long reserveAndGetWaitLength(int permits, long nowMicros) {
@@ -398,6 +398,7 @@ public abstract class RateLimiter {
      * @return the time that permits are available, or, if permits are available immediately, an
      * arbitrary past or present time
      */
+    // 返回的是nextFreeTicketMicros
     abstract long queryEarliestAvailable(long nowMicros);
 
     /**
@@ -407,6 +408,7 @@ public abstract class RateLimiter {
      * @return the time that the permits may be used, or, if the permits may be used immediately, an
      * arbitrary past or present time
      */
+    // 返回需要等待多久,同时更新storedPermits等信息
     abstract long reserveEarliestAvailable(int permits, long nowMicros);
 
     @Override
